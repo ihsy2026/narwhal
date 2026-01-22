@@ -4,8 +4,8 @@ use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, Round};
-use std::cmp::max;
-use std::collections::{HashMap, HashSet};
+use std::cmp::{max, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[cfg(test)]
@@ -25,6 +25,19 @@ struct State {
     /// Keeps the latest committed certificate (and its parents) for every authority. Anything older
     /// must be regularly cleaned up through the function `update`.
     dag: Dag,
+    /// Tracks the rounds in which each authority produced committed certificates.
+    activity_rounds: HashMap<PublicKey, VecDeque<Round>>,
+    /// Tracks recent commit delays for each authority (commit round - certificate round).
+    delay_history: HashMap<PublicKey, VecDeque<Round>>,
+    /// Tracks recent anchor (leader) votes for structural contribution scoring.
+    anchor_history: VecDeque<AnchorRecord>,
+    /// Cached reputation scores for each authority.
+    reputations: HashMap<PublicKey, f64>,
+}
+
+struct AnchorRecord {
+    round: Round,
+    voters: HashSet<PublicKey>,
 }
 
 impl State {
@@ -38,6 +51,10 @@ impl State {
             last_committed_round: 0,
             last_committed: genesis.iter().map(|(x, (_, y))| (*x, y.round())).collect(),
             dag: [(0, genesis)].iter().cloned().collect(),
+            activity_rounds: HashMap::new(),
+            delay_history: HashMap::new(),
+            anchor_history: VecDeque::new(),
+            reputations: HashMap::new(),
         }
     }
 
@@ -57,6 +74,40 @@ impl State {
                 !authorities.is_empty() && r + gc_depth >= last_committed_round
             });
         }
+    }
+
+    fn track_commit(&mut self, certificate: &Certificate, commit_round: Round) {
+        let min_round = commit_round.saturating_sub(49);
+        let rounds = self
+            .activity_rounds
+            .entry(certificate.origin())
+            .or_insert_with(VecDeque::new);
+        rounds.push_back(certificate.round());
+        while rounds.front().map_or(false, |r| *r < min_round) {
+            rounds.pop_front();
+        }
+
+        let delay = commit_round.saturating_sub(certificate.round());
+        let delays = self
+            .delay_history
+            .entry(certificate.origin())
+            .or_insert_with(VecDeque::new);
+        delays.push_back(delay);
+        while delays.len() > 50 {
+            delays.pop_front();
+        }
+    }
+
+    fn record_anchor(&mut self, leader: &Certificate) {
+        let anchor_round = leader.round();
+        let min_round = anchor_round.saturating_sub(99);
+        self.anchor_history.retain(|record| record.round >= min_round);
+
+        let voters = leader.votes.iter().map(|(name, _)| *name).collect();
+        self.anchor_history.push_back(AnchorRecord {
+            round: anchor_round,
+            voters,
+        });
     }
 }
 
@@ -131,7 +182,7 @@ impl Consensus {
             if leader_round <= state.last_committed_round {
                 continue;
             }
-            let (leader_digest, leader) = match self.leader(leader_round, &state.dag) {
+            let (leader_digest, leader) = match self.leader(leader_round, &state.dag, &state) {
                 Some(x) => x,
                 None => continue,
             };
@@ -157,15 +208,24 @@ impl Consensus {
             // Get an ordered list of past leaders that are linked to the current leader.
             debug!("Leader {:?} has enough support", leader);
             let mut sequence = Vec::new();
+            let mut anchors = Vec::new();
+            let commit_round = r;
             for leader in self.order_leaders(leader, &state).iter().rev() {
                 // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
                 for x in self.order_dag(leader, &state) {
                     // Update and clean up internal state.
                     state.update(&x, self.gc_depth);
+                    state.track_commit(&x, commit_round);
 
                     // Add the certificate to the sequence.
                     sequence.push(x);
                 }
+                anchors.push(leader.clone());
+            }
+
+            for anchor in anchors {
+                state.record_anchor(&anchor);
+                self.update_reputations(&mut state);
             }
 
             // Log the latest committed round of every authority (for debug).
@@ -200,19 +260,33 @@ impl Consensus {
 
     /// Returns the certificate (and the certificate's digest) originated by the leader of the
     /// specified round (if any).
-    fn leader<'a>(&self, round: Round, dag: &'a Dag) -> Option<&'a (Digest, Certificate)> {
-        // TODO: We should elect the leader of round r-2 using the common coin revealed at round r.
-        // At this stage, we are guaranteed to have 2f+1 certificates from round r (which is enough to
-        // compute the coin). We currently just use round-robin.
-        #[cfg(test)]
-        let coin = 0;
-        #[cfg(not(test))]
-        let coin = round;
-
-        // Elect the leader.
+    fn leader<'a>(
+        &self,
+        round: Round,
+        dag: &'a Dag,
+        state: &State,
+    ) -> Option<&'a (Digest, Certificate)> {
+        // Elect the leader based on the highest reputation score.
         let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
         keys.sort();
-        let leader = keys[coin as usize % self.committee.size()];
+        let mut scored: Vec<_> = keys
+            .into_iter()
+            .map(|key| {
+                let score = state
+                    .reputations
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_else(|| self.reputation_score(state, &key));
+                (key, score)
+            })
+            .collect();
+        scored.sort_by(|(left_key, left_score), (right_key, right_score)| {
+            right_score
+                .partial_cmp(left_score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left_key.cmp(right_key))
+        });
+        let leader = scored.first()?.0;
 
         // Return its certificate and the certificate's digest.
         dag.get(&round).map(|x| x.get(&leader)).flatten()
@@ -227,7 +301,7 @@ impl Consensus {
             .step_by(2)
         {
             // Get the certificate proposed by the previous leader.
-            let (_, prev_leader) = match self.leader(r, &state.dag) {
+            let (_, prev_leader) = match self.leader(r, &state.dag, state) {
                 Some(x) => x,
                 None => continue,
             };
@@ -298,5 +372,54 @@ impl Consensus {
         // Ordering the output by round is not really necessary but it makes the commit sequence prettier.
         ordered.sort_by_key(|x| x.round());
         ordered
+    }
+
+    fn update_reputations(&self, state: &mut State) {
+        for authority in self.committee.authorities.keys() {
+            let score = self.reputation_score(state, authority);
+            state.reputations.insert(*authority, score);
+        }
+    }
+
+    fn reputation_score(&self, state: &State, authority: &PublicKey) -> f64 {
+        let activity_rounds = state.activity_rounds.get(authority);
+        let unique_rounds: HashSet<Round> = activity_rounds
+            .map(|rounds| rounds.iter().copied().collect())
+            .unwrap_or_default();
+        let activity = unique_rounds.len() as f64 / 50.0;
+
+        let timely = match state.delay_history.get(authority) {
+            Some(delays) if !delays.is_empty() => {
+                let mut values: Vec<_> = delays.iter().copied().collect();
+                values.sort_unstable();
+                let mid = values.len() / 2;
+                let median = if values.len() % 2 == 0 {
+                    (values[mid - 1] + values[mid]) as f64 / 2.0
+                } else {
+                    values[mid] as f64
+                };
+                (-0.3 * median).exp()
+            }
+            _ => 0.0,
+        };
+
+        let (anchors, votes) = if state.anchor_history.is_empty() {
+            (0usize, 0usize)
+        } else {
+            let total = state.anchor_history.len();
+            let voted = state
+                .anchor_history
+                .iter()
+                .filter(|record| record.voters.contains(authority))
+                .count();
+            (total, voted)
+        };
+        let structure = if anchors == 0 {
+            0.0
+        } else {
+            votes as f64 / anchors as f64
+        };
+
+        0.45 * activity + 0.30 * timely + 0.25 * structure
     }
 }
