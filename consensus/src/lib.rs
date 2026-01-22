@@ -4,8 +4,8 @@ use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, Round};
-use std::cmp::{max, Ordering};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::max;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[cfg(test)]
@@ -26,19 +26,6 @@ struct State {
     /// Keeps the latest committed certificate (and its parents) for every authority. Anything older
     /// must be regularly cleaned up through the function `update`.
     dag: Dag,
-    /// Tracks the rounds in which each authority produced committed certificates.
-    activity_rounds: HashMap<PublicKey, VecDeque<Round>>,
-    /// Tracks recent commit delays for each authority (commit round - certificate round).
-    delay_history: HashMap<PublicKey, VecDeque<Round>>,
-    /// Tracks recent anchor (leader) votes for structural contribution scoring.
-    anchor_history: VecDeque<AnchorRecord>,
-    /// Cached reputation scores for each authority.
-    reputations: HashMap<PublicKey, f64>,
-}
-
-struct AnchorRecord {
-    round: Round,
-    voters: HashSet<PublicKey>,
 }
 
 impl State {
@@ -57,10 +44,6 @@ impl State {
             // 从genesis中取出（PublicKey, Round）
             last_committed: genesis.iter().map(|(x, (_, y))| (*x, y.round())).collect(),
             dag: [(0, genesis)].iter().cloned().collect(),
-            activity_rounds: HashMap::new(),
-            delay_history: HashMap::new(),
-            anchor_history: VecDeque::new(),
-            reputations: HashMap::new(),
         }
     }
 
@@ -83,39 +66,6 @@ impl State {
                 !authorities.is_empty() && r + gc_depth >= last_committed_round
             });
         }
-    }
-    fn track_commit(&mut self, certificate: &Certificate, commit_round: Round) {
-        let min_round = commit_round.saturating_sub(49);
-        let rounds = self
-            .activity_rounds
-            .entry(certificate.origin())
-            .or_insert_with(VecDeque::new);
-        rounds.push_back(certificate.round());
-        while rounds.front().map_or(false, |r| *r < min_round) {
-            rounds.pop_front();
-        }
-
-        let delay = commit_round.saturating_sub(certificate.round());
-        let delays = self
-            .delay_history
-            .entry(certificate.origin())
-            .or_insert_with(VecDeque::new);
-        delays.push_back(delay);
-        while delays.len() > 50 {
-            delays.pop_front();
-        }
-    }
-
-    fn record_anchor(&mut self, leader: &Certificate) {
-        let anchor_round = leader.round();
-        let min_round = anchor_round.saturating_sub(99);
-        self.anchor_history.retain(|record| record.round >= min_round);
-
-        let voters = leader.votes.iter().map(|(name, _)| *name).collect();
-        self.anchor_history.push_back(AnchorRecord {
-            round: anchor_round,
-            voters,
-        });
     }
 }
 
@@ -198,7 +148,7 @@ impl Consensus {
                 continue;
             }
             // 取出锚点的证书，如果还没收到锚点则继续监听
-            let (leader_digest, leader) = match self.leader(leader_round, &state.dag, &state) {
+            let (leader_digest, leader) = match self.leader(leader_round, &state.dag) {
                 Some(x) => x,
                 None => continue,
             };
@@ -225,8 +175,6 @@ impl Consensus {
             // leader 达标，准备生成提交序列 sequence
             debug!("Leader {:?} has enough support", leader);
             let mut sequence = Vec::new();
-            let mut anchors = Vec::new();
-            let commit_round = r;
             // 找出与当前leader往前连接的最前面的leader并反转，保证提交顺序正确
             for leader in self.order_leaders(leader, &state).iter().rev() {
                 // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
@@ -234,17 +182,10 @@ impl Consensus {
                     // Update and clean up internal state.
                     // 每提交一个证书更新state并进行GC
                     state.update(&x, self.gc_depth);
-                    state.track_commit(&x, commit_round);
                     // Add the certificate to the sequence.
                     // 把该证书加入最终输出序列
                     sequence.push(x);
                 }
-                anchors.push(leader.clone());
-            }
-
-            for anchor in anchors {
-                state.record_anchor(&anchor);
-                self.update_reputations(&mut state);
             }
 
             // Log the latest committed round of every authority (for debug).
@@ -281,16 +222,23 @@ impl Consensus {
 
     /// Returns the certificate (and the certificate's digest) originated by the leader of the
     /// specified round (if any).
-    fn leader<'a>(
-        &self,
-        round: Round,
-        dag: &'a Dag,
-        state: &State,
-    ) -> Option<&'a (Digest, Certificate)> {
+    fn leader<'a>(&self, round: Round, dag: &'a Dag) -> Option<&'a (Digest, Certificate)> {
+        // TODO: We should elect the leader of round r-2 using the common coin revealed at round r.
+        // At this stage, we are guaranteed to have 2f+1 certificates from round r (which is enough to
+        // compute the coin). We currently just use round-robin.
+        #[cfg(test)]
+        let coin = 0;
+        #[cfg(not(test))]
+        let coin = round;
+
+        // Elect the leader.
         let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
         keys.sort();
+        let leader = keys[coin as usize % self.committee.size()];
+
+        // Return its certificate and the certificate's digest.
+        dag.get(&round).map(|x| x.get(&leader)).flatten()
     }
-        // Elect the leader based on the highest reputation score.
 
     /// Order the past leaders that we didn't already commit.
     /// 把过去那些还没提交的 leader 按顺序挑出来
