@@ -26,7 +26,6 @@ struct State {
     /// must be regularly cleaned up through the function `update`.
     dag: Dag,
     /// Tracks the rounds in which each authority produced committed certificates.
-    /// VecDeque<Round>存放Round的双端队列
     activity_rounds: HashMap<PublicKey, VecDeque<Round>>,
     /// Tracks recent commit delays for each authority (commit round - certificate round).
     delay_history: HashMap<PublicKey, VecDeque<Round>>,
@@ -77,10 +76,8 @@ impl State {
         }
     }
 
-    // 在某个证书被提交时，更新该节点在“最近 50 轮”内的活跃记录和提交延迟统计。
     fn track_commit(&mut self, certificate: &Certificate, commit_round: Round) {
         let min_round = commit_round.saturating_sub(49);
-        // 更新activity_rounds
         let rounds = self
             .activity_rounds
             .entry(certificate.origin())
@@ -89,7 +86,7 @@ impl State {
         while rounds.front().map_or(false, |r| *r < min_round) {
             rounds.pop_front();
         }
-        // 更新delay_history
+
         let delay = commit_round.saturating_sub(certificate.round());
         let delays = self
             .delay_history
@@ -103,7 +100,7 @@ impl State {
 
     fn record_anchor(&mut self, leader: &Certificate) {
         let anchor_round = leader.round();
-        let min_round = anchor_round.saturating_sub(49);
+        let min_round = anchor_round.saturating_sub(99);
         self.anchor_history.retain(|record| record.round >= min_round);
 
         let voters = leader.votes.iter().map(|(name, _)| *name).collect();
@@ -179,51 +176,54 @@ impl Consensus {
                 continue;
             }
 
-            // Get the certificate's digest of the leader of round r-2. If we already ordered this leader,
+            // Get the certificate's digest of the leaders of round r-2. If we already ordered this leader,
             // there is nothing to do.
             let leader_round = r - 2;
-            if leader_round <= state.last_committed_round {
+            let initial_last_committed_round = state.last_committed_round;
+            if leader_round <= initial_last_committed_round {
                 continue;
             }
-            let (leader_digest, leader) = match self.leader(leader_round, &state.dag, &state) {
-                Some(x) => x,
-                None => continue,
-            };
-
-            // Check if the leader has f+1 support from its children (ie. round r-1).
-            let stake: Stake = state
-                .dag
-                .get(&(r - 1))
-                .expect("We should have the whole history by now")
-                .values()
-                .filter(|(_, x)| x.header.parents.contains(&leader_digest))
-                .map(|(_, x)| self.committee.stake(&x.origin()))
-                .sum();
-
-            // If it is the case, we can commit the leader. But first, we need to recursively go back to
-            // the last committed leader, and commit all preceding leaders in the right order. Committing
-            // a leader block means committing all its dependencies.
-            if stake < self.committee.validity_threshold() {
-                debug!("Leader {:?} does not have enough support", leader);
+            let leaders = self.leader_candidates(leader_round, &state.dag, &state);
+            if leaders.is_empty() {
                 continue;
             }
 
-            // Get an ordered list of past leaders that are linked to the current leader.
-            debug!("Leader {:?} has enough support", leader);
             let mut sequence = Vec::new();
             let mut anchors = Vec::new();
             let commit_round = r;
-            for leader in self.order_leaders(leader, &state).iter().rev() {
-                // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
-                for x in self.order_dag(leader, &state) {
-                    // Update and clean up internal state.
-                    state.update(&x, self.gc_depth);
-                    state.track_commit(&x, commit_round);
+            for (leader_digest, leader) in leaders {
+                // Check if the leader has f+1 support from its children (ie. round r-1).
+                let stake: Stake = state
+                    .dag
+                    .get(&(r - 1))
+                    .expect("We should have the whole history by now")
+                    .values()
+                    .filter(|(_, x)| x.header.parents.contains(&leader_digest))
+                    .map(|(_, x)| self.committee.stake(&x.origin()))
+                    .sum();
 
-                    // Add the certificate to the sequence.
-                    sequence.push(x);
+                // If it is the case, we can commit the leader. But first, we need to recursively go back to
+                // the last committed leader, and commit all preceding leaders in the right order. Committing
+                // a leader block means committing all its dependencies.
+                if stake < self.committee.validity_threshold() {
+                    debug!("Leader {:?} does not have enough support", leader);
+                    break;
                 }
-                anchors.push(leader.clone());
+
+                // Get an ordered list of past leaders that are linked to the current leader.
+                debug!("Leader {:?} has enough support", leader);
+                for leader in self.order_leaders(&leader, &state).iter().rev() {
+                    // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
+                    for x in self.order_dag(leader, &state) {
+                        // Update and clean up internal state.
+                        state.update(&x, self.gc_depth);
+                        state.track_commit(&x, commit_round);
+
+                        // Add the certificate to the sequence.
+                        sequence.push(x);
+                    }
+                    anchors.push(leader.clone());
+                }
             }
 
             for anchor in anchors {
@@ -263,13 +263,13 @@ impl Consensus {
 
     /// Returns the certificate (and the certificate's digest) originated by the leader of the
     /// specified round (if any).
-    fn leader<'a>(
+    fn leader_candidates<'a>(
         &self,
         round: Round,
         dag: &'a Dag,
         state: &State,
-    ) -> Option<&'a (Digest, Certificate)> {
-        // Elect the leader based on the highest reputation score.
+    ) -> Vec<(Digest, Certificate)> {
+        // Elect the leaders based on the highest reputation scores.
         let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
         keys.sort();
         let mut scored: Vec<_> = keys
@@ -289,28 +289,39 @@ impl Consensus {
                 .unwrap_or(Ordering::Equal)
                 .then_with(|| left_key.cmp(right_key))
         });
-        let leader = scored.first()?.0;
+        let leaders_to_try = self
+            .committee
+            .size()
+            .saturating_sub(self.committee.size().saturating_sub(1) / 3);
 
-        // Return its certificate and the certificate's digest.
-        dag.get(&round).map(|x| x.get(&leader)).flatten()
+        let mut leaders = Vec::new();
+        if let Some(entries) = dag.get(&round) {
+            for (key, _) in scored.into_iter().take(leaders_to_try) {
+                if let Some((digest, certificate)) = entries.get(&key) {
+                    leaders.push((digest.clone(), certificate.clone()));
+                }
+            }
+        }
+        leaders
     }
 
     /// Order the past leaders that we didn't already commit.
     fn order_leaders(&self, leader: &Certificate, state: &State) -> Vec<Certificate> {
         let mut to_commit = vec![leader.clone()];
-        let mut leader = leader;
+        let mut leader = leader.clone();
         for r in (state.last_committed_round + 2..leader.round())
             .rev()
             .step_by(2)
         {
             // Get the certificate proposed by the previous leader.
-            let (_, prev_leader) = match self.leader(r, &state.dag, state) {
-                Some(x) => x,
+            let candidates = self.leader_candidates(r, &state.dag, state);
+            let prev_leader = match candidates.first() {
+                Some((_, leader)) => leader.clone(),
                 None => continue,
             };
 
             // Check whether there is a path between the last two leaders.
-            if self.linked(leader, prev_leader, &state.dag) {
+            if self.linked(&leader, &prev_leader, &state.dag) {
                 to_commit.push(prev_leader.clone());
                 leader = prev_leader;
             }
