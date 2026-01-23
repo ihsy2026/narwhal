@@ -212,7 +212,7 @@ impl Consensus {
 
                 // Get an ordered list of past leaders that are linked to the current leader.
                 debug!("Leader {:?} has enough support", leader);
-                for leader in self.order_leaders(leader, &state).iter().rev() {
+                for leader in self.order_leaders(&leader, &state).iter().rev() {
                     // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
                     for x in self.order_dag(leader, &state) {
                         // Update and clean up internal state.
