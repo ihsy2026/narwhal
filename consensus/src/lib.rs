@@ -308,7 +308,7 @@ impl Consensus {
     /// Order the past leaders that we didn't already commit.
     fn order_leaders(&self, leader: &Certificate, state: &State) -> Vec<Certificate> {
         let mut to_commit = vec![leader.clone()];
-        let mut leader = leader;
+        let mut leader = leader.clone();
         for r in (state.last_committed_round + 2..leader.round())
             .rev()
             .step_by(2)
@@ -316,12 +316,12 @@ impl Consensus {
             // Get the certificate proposed by the previous leader.
             let candidates = self.leader_candidates(r, &state.dag, state);
             let prev_leader = match candidates.first() {
-                Some((_, leader)) => leader,
+                Some((_, leader)) => leader.clone(),
                 None => continue,
             };
 
             // Check whether there is a path between the last two leaders.
-            if self.linked(leader, prev_leader, &state.dag) {
+            if self.linked(&leader, &prev_leader, &state.dag) {
                 to_commit.push(prev_leader.clone());
                 leader = prev_leader;
             }
