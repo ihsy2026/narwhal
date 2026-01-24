@@ -217,7 +217,17 @@ impl HeaderWaiter {
                                     .primary_to_primary;
                                 let message = PrimaryMessage::CertificatesRequest(requires_sync, self.name);
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                self.network.send(address, Bytes::from(bytes)).await;
+                                let payload = Bytes::from(bytes);
+                                self.network.send(address, payload.clone()).await;
+                                let addresses = self.committee
+                                    .others_primaries(&self.name)
+                                    .into_iter()
+                                    .filter(|(name, _)| name != &author)
+                                    .map(|(_, x)| x.primary_to_primary)
+                                    .collect();
+                                self.network
+                                    .lucky_broadcast(addresses, payload, self.sync_retry_nodes)
+                                    .await;
                             }
                         }
                     }
