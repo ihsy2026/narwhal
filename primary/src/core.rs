@@ -409,8 +409,9 @@ impl Core {
                 self.processing.retain(|k, _| k >= &gc_round);
                 self.certificates_aggregators.retain(|k, _| k >= &gc_round);
                 self.headers.retain(|_, header| header.round >= gc_round);
+                let active_headers: HashSet<_> = self.headers.keys().cloned().collect();
                 self.votes_aggregators
-                    .retain(|digest, _| self.headers.contains_key(digest));
+                    .retain(|digest, _| active_headers.contains(digest));
                 self.pending_votes
                     .retain(|_, votes| votes.iter().any(|vote| vote.round >= gc_round));
                 self.cancel_handlers.retain(|k, _| k >= &gc_round);
