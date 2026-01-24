@@ -21,7 +21,7 @@ async fn process_header() {
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
-    let (tx_consensus, mut rx_consensus) = channel(1);
+    let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     // Create a new test store.
@@ -98,7 +98,7 @@ async fn process_header_missing_parent() {
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
-    let (tx_consensus, mut rx_consensus) = channel(1);
+    let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     // Create a new test store.
@@ -158,7 +158,7 @@ async fn process_header_missing_payload() {
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
-    let (tx_consensus, mut rx_consensus) = channel(1);
+    let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     // Create a new test store.
