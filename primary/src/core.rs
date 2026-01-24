@@ -10,7 +10,7 @@ use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, error, warn};
-use network::{CancelHandler, ReliableSender};
+use network::{CancelHandler, ReliableSender, SimpleSender};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -66,6 +66,8 @@ pub struct Core {
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>,
     /// A network sender to send the batches to the other workers.
     network: ReliableSender,
+    /// A best-effort sender for broadcasting votes.
+    vote_network: SimpleSender,
     /// Keeps the cancel handlers of the messages we sent.
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
 }
@@ -110,6 +112,7 @@ impl Core {
                 pending_votes: HashMap::with_capacity(2 * gc_depth as usize),
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 network: ReliableSender::new(),
+                vote_network: SimpleSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
             }
             .run()
@@ -207,11 +210,9 @@ impl Core {
                 .collect();
             let bytes = bincode::serialize(&PrimaryMessage::Vote(vote.clone()))
                 .expect("Failed to serialize our own vote");
-            let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
-            self.cancel_handlers
-                .entry(header.round)
-                .or_insert_with(Vec::new)
-                .extend(handlers);
+            self.vote_network
+                .broadcast(addresses, Bytes::from(bytes))
+                .await;
             self.process_vote(vote)
                 .await
                 .expect("Failed to process our own vote");
