@@ -33,12 +33,12 @@ async fn process_header() {
     // Make the vote we expect to receive.
     let expected = Vote::new(&header(), &name, &mut signature_service).await;
 
-    // Spawn a listener to receive the vote.
-    let address = committee
-        .primary(&header().author)
-        .unwrap()
-        .primary_to_primary;
-    let handle = listener(address);
+    // Spawn listeners to receive the vote broadcast.
+    let handles: Vec<_> = committee
+        .others_primaries(&name)
+        .iter()
+        .map(|(_, address)| listener(address.primary_to_primary))
+        .collect();
 
     // Make a synchronizer for the core.
     let synchronizer = Synchronizer::new(
@@ -72,11 +72,12 @@ async fn process_header() {
         .await
         .unwrap();
 
-    // Ensure the listener correctly received the vote.
-    let received = handle.await.unwrap();
-    match bincode::deserialize(&received).unwrap() {
-        PrimaryMessage::Vote(x) => assert_eq!(x, expected),
-        x => panic!("Unexpected message: {:?}", x),
+    // Ensure listeners correctly received the vote.
+    for received in try_join_all(handles).await.unwrap() {
+        match bincode::deserialize(&received).unwrap() {
+            PrimaryMessage::Vote(x) => assert_eq!(x, expected),
+            x => panic!("Unexpected message: {:?}", x),
+        }
     }
 
     // Ensure the header is correctly stored.
@@ -221,13 +222,13 @@ async fn process_votes() {
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
     let (_tx_headers, rx_headers) = channel(1);
-    let (tx_consensus, _rx_consensus) = channel(1);
+    let (tx_consensus, mut rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_vote";
     let _ = fs::remove_dir_all(path);
-    let store = Store::new(path).unwrap();
+    let mut store = Store::new(path).unwrap();
 
     // Make a synchronizer for the core.
     let synchronizer = Synchronizer::new(
@@ -255,31 +256,25 @@ async fn process_votes() {
         /* tx_proposer */ tx_parents,
     );
 
-    // Make the certificate we expect to receive.
-    let expected = certificate(&Header::default());
+    // Store the header so we can aggregate votes locally.
+    let header = header();
+    let bytes = bincode::serialize(&header).unwrap();
+    store.write(header.id.to_vec(), bytes).await;
 
-    // Spawn all listeners to receive our newly formed certificate.
-    let handles: Vec<_> = committee
-        .others_primaries(&name)
-        .iter()
-        .map(|(_, address)| listener(address.primary_to_primary))
-        .collect();
+    // Make the certificate we expect to receive.
+    let expected = certificate(&header);
 
     // Send a votes to the core.
-    for vote in votes(&Header::default()) {
+    for vote in votes(&header) {
         tx_primary_messages
             .send(PrimaryMessage::Vote(vote))
             .await
             .unwrap();
     }
 
-    // Ensure all listeners got the certificate.
-    for received in try_join_all(handles).await.unwrap() {
-        match bincode::deserialize(&received).unwrap() {
-            PrimaryMessage::Certificate(x) => assert_eq!(x, expected),
-            x => panic!("Unexpected message: {:?}", x),
-        }
-    }
+    // Ensure the certificate is delivered locally to consensus.
+    let received = rx_consensus.recv().await.unwrap();
+    assert_eq!(received, expected);
 }
 
 #[tokio::test]

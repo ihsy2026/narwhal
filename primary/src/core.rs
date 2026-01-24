@@ -65,12 +65,12 @@ pub struct Core {
     /// The set of headers we are currently processing.
     /// 正在处理的 header（防止重复处理、避免循环）
     processing: HashMap<Round, HashSet<Digest>>,
-    /// The last header we proposed (for which we are waiting votes).
-    /// 本节点刚提出、正在收集投票的 header（聚合 vote 时需要对齐）
-    current_header: Header,
-    /// Aggregates votes into a certificate.
-    /// 收集 vote，达到阈值就产出 certificate
-    votes_aggregator: VotesAggregator,
+    /// Tracks votes and related headers for local certificate assembly.
+    /// 按 header 本地聚合 votes，达到阈值就产出 certificate
+    votes_aggregators: HashMap<Digest, VoteState>,
+    /// Votes that arrived before their header is available locally.
+    /// header 未到时的暂存 vote
+    pending_votes: HashMap<Digest, Vec<Vote>>,
     /// Aggregates certificates to use as parents for new headers.
     /// 收集同轮 certificate，凑到 quorum 就把 digest 列表发给 proposer 当 parents
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>,
@@ -80,6 +80,11 @@ pub struct Core {
     /// Keeps the cancel handlers of the messages we sent.
     /// 记录每轮发送的消息的取消句柄（便于 GC 时停止重试/重发）
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
+}
+
+struct VoteState {
+    header: Header,
+    aggregator: VotesAggregator,
 }
 
 impl Core {
@@ -117,24 +122,19 @@ impl Core {
                 gc_round: 0,
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
-                current_header: Header::default(),
-                votes_aggregator: VotesAggregator::new(),
+                votes_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
+                pending_votes: HashMap::with_capacity(2 * gc_depth as usize),
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
             }
-            .run()
-            .await;
+                .run()
+                .await;
         });
     }
 
     /// 处理自己刚提议的 header
     async fn process_own_header(&mut self, header: Header) -> DagResult<()> {
-        // Reset the votes aggregator.
-        self.current_header = header.clone();
-        // 收集当前提出的header的投票
-        self.votes_aggregator = VotesAggregator::new();
-
         // Broadcast the new header in a reliable manner.
         // 找到其他所有 primary 的 primary_to_primary 地址列表（排除自己）
         let addresses = self
@@ -211,6 +211,13 @@ impl Core {
         let bytes = bincode::serialize(header).expect("Failed to serialize header");
         self.store.write(header.id.to_vec(), bytes).await;
 
+        // Process any pending votes for this header.
+        if let Some(votes) = self.pending_votes.remove(&header.id) {
+            for vote in votes {
+                self.process_vote_with_header(vote, header).await?;
+            }
+        }
+
         // Check if we can vote for this header.
         // 生成vote，每轮对一个author只投一次
         if self
@@ -219,67 +226,76 @@ impl Core {
             .or_insert_with(HashSet::new)
             .insert(header.author)
         {
-            // Make a vote and send it to the header's creator.
-            // 创建投票
+            // Make a vote and broadcast it.
+            // 创建投票并广播给所有节点
             let vote = Vote::new(header, &self.name, &mut self.signature_service).await;
             debug!("Created {:?}", vote);
-            // 如果是自己调用process_vote给自己投票
-            if vote.origin == self.name {
-                self.process_vote(vote)
-                    .await
-                    .expect("Failed to process our own vote");
-            } else {
-                // 如果不是自己提出的，则找到 header.author 的 primary 地址（把 vote 发回 header 创建者）
-                let address = self
-                    .committee
-                    .primary(&header.author)
-                    .expect("Author of valid header is not in the committee")
-                    .primary_to_primary;
-                // 序列化
-                let bytes = bincode::serialize(&PrimaryMessage::Vote(vote))
-                    .expect("Failed to serialize our own vote");
-                let handler = self.network.send(address, Bytes::from(bytes)).await;
-                self.cancel_handlers
-                    .entry(header.round)
-                    .or_insert_with(Vec::new)
-                    .push(handler);
-            }
-        }
-        Ok(())
-    }
-
-    /// 聚合 votes，够阈值就组装证书并广播
-    #[async_recursion]
-    async fn process_vote(&mut self, vote: Vote) -> DagResult<()> {
-        debug!("Processing {:?}", vote);
-
-        // Add it to the votes' aggregator and try to make a new certificate.
-        // 处理一个vote，如果聚合到足够的stake（quorum）则组装证书
-        if let Some(certificate) =
-            self.votes_aggregator
-                .append(vote, &self.committee, &self.current_header)?
-        {
-            debug!("Assembled {:?}", certificate);
-
-            // Broadcast the certificate.
+            // 广播 vote
             let addresses = self
                 .committee
                 .others_primaries(&self.name)
                 .iter()
                 .map(|(_, x)| x.primary_to_primary)
                 .collect();
-            // 序列化
-            let bytes = bincode::serialize(&PrimaryMessage::Certificate(certificate.clone()))
-                .expect("Failed to serialize our own certificate");
-            // 广播证书
+            let bytes = bincode::serialize(&PrimaryMessage::Vote(vote.clone()))
+                .expect("Failed to serialize our own vote");
             let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
             self.cancel_handlers
-                .entry(certificate.round())
+                .entry(header.round)
                 .or_insert_with(Vec::new)
                 .extend(handlers);
 
-            // Process the new certificate.
-            // 本地也处理证书进入共识
+            // 本地也处理 vote 以进行证书聚合
+            self.process_vote(vote)
+                .await
+                .expect("Failed to process our own vote");
+        }
+        Ok(())
+    }
+
+    /// 聚合 votes，够阈值就组装证书
+    #[async_recursion]
+    async fn process_vote(&mut self, vote: Vote) -> DagResult<()> {
+        debug!("Processing {:?}", vote);
+
+        // Try to find the header locally; if unavailable, stash the vote for later.
+        if let Some(state) = self.votes_aggregators.get(&vote.id) {
+            let header = state.header.clone();
+            return self.process_vote_with_header(vote, &header).await;
+        }
+
+        if let Some(bytes) = self.store.read(vote.id.to_vec()).await? {
+            let header: Header =
+                bincode::deserialize(&bytes).expect("Failed to deserialize stored header");
+            return self.process_vote_with_header(vote, &header).await;
+        }
+
+        self.pending_votes
+            .entry(vote.id.clone())
+            .or_insert_with(Vec::new)
+            .push(vote);
+        Ok(())
+    }
+
+    async fn process_vote_with_header(&mut self, vote: Vote, header: &Header) -> DagResult<()> {
+        ensure!(
+            vote.id == header.id && vote.origin == header.author && vote.round == header.round,
+            DagError::UnexpectedVote(vote.id.clone())
+        );
+
+        let state = self.votes_aggregators.entry(header.id.clone()).or_insert_with(|| {
+            VoteState {
+                header: header.clone(),
+                aggregator: VotesAggregator::new(),
+            }
+        });
+
+        if let Some(certificate) = state.aggregator.append(vote, &self.committee, &state.header)? {
+            debug!("Assembled {:?}", certificate);
+            self.votes_aggregators.remove(&certificate.header.id);
+            self.pending_votes.remove(&certificate.header.id);
+
+            // Process the new certificate locally (no broadcast).
             self.process_certificate(certificate)
                 .await
                 .expect("Failed to process valid certificate");
@@ -371,16 +387,8 @@ impl Core {
     // 验证投票签名
     fn sanitize_vote(&mut self, vote: &Vote) -> DagResult<()> {
         ensure!(
-            self.current_header.round <= vote.round,
+            self.gc_round <= vote.round,
             DagError::TooOld(vote.digest(), vote.round)
-        );
-
-        // Ensure we receive a vote on the expected header.
-        ensure!(
-            vote.id == self.current_header.id
-                && vote.origin == self.current_header.author
-                && vote.round == self.current_header.round,
-            DagError::UnexpectedVote(vote.id.clone())
         );
 
         // Verify the vote.
@@ -462,6 +470,13 @@ impl Core {
                 let gc_round = round - self.gc_depth;
                 self.last_voted.retain(|k, _| k >= &gc_round);
                 self.processing.retain(|k, _| k >= &gc_round);
+                self.votes_aggregators
+                    .retain(|_, state| state.header.round >= gc_round);
+                self.pending_votes.retain(|_, votes| {
+                    votes
+                        .first()
+                        .map_or(false, |vote| vote.round >= gc_round)
+                });
                 self.certificates_aggregators.retain(|k, _| k >= &gc_round);
                 self.cancel_handlers.retain(|k, _| k >= &gc_round);
                 self.gc_round = gc_round;
