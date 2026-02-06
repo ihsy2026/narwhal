@@ -1,8 +1,10 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
+import base64
 from datetime import datetime
 from glob import glob
+from json import load
 from multiprocessing import Pool
-from os.path import join
+from os.path import exists, join
 from re import findall, search
 from statistics import mean
 
@@ -14,7 +16,15 @@ class ParseError(Exception):
 
 
 class LogParser:
-    def __init__(self, clients, primaries, workers, faults=0):
+    def __init__(
+        self,
+        clients,
+        primaries,
+        workers,
+        faults=0,
+        committee_keys=None,
+        committee_lookup=None,
+    ):
         inputs = [clients, primaries, workers]
         assert all(isinstance(x, list) for x in inputs)
         assert all(isinstance(x, str) for y in inputs for x in y)
@@ -44,9 +54,17 @@ class LogParser:
                 results = p.map(self._parse_primaries, primaries)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse nodes\' logs: {e}')
-        proposals, commits, self.configs, primary_ips = zip(*results)
+        proposals, commits, self.configs, primary_ips, headers, primary_names = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
+        self.headers = self._merge_headers(headers)
+        self.committee_keys = (
+            committee_keys
+            if committee_keys
+            else sorted(set(primary_names))
+        )
+        self.committee_lookup = committee_lookup or {}
+        self._mark_leaders()
 
         # Parse the workers logs.
         try:
@@ -77,6 +95,17 @@ class LogParser:
                     merged[k] = v
         return merged
 
+    def _merge_headers(self, header_dicts):
+        merged = {}
+        for headers in header_dicts:
+            for digest, info in headers.items():
+                merged.setdefault(digest, info)
+        return merged
+
+    def _resolve_author(self, author):
+        resolved = self.committee_lookup.get(author)
+        return resolved if resolved else author
+
     def _parse_clients(self, log):
         if search(r'Error', log) is not None:
             raise ParseError('Client(s) panicked')
@@ -98,13 +127,21 @@ class LogParser:
         if search(r'(?:panicked|Error)', log) is not None:
             raise ParseError('Primary(s) panicked')
 
-        tmp = findall(r'\[(.*Z) .* Created B\d+\([^ ]+\) -> ([^ ]+=)', log)
-        tmp = [(d, self._to_posix(t)) for t, d in tmp]
-        proposals = self._merge_results([tmp])
+        headers = {}
 
-        tmp = findall(r'\[(.*Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)', log)
-        tmp = [(d, self._to_posix(t)) for t, d in tmp]
-        commits = self._merge_results([tmp])
+        tmp = findall(r'\[(.*Z) .* Created B(\d+)\(([^)]+)\) -> ([^ ]+=)', log)
+        proposals = self._merge_results(
+            [[(d, self._to_posix(t)) for t, _, _, d in tmp]]
+        )
+        for _, round_number, author, digest in tmp:
+            headers.setdefault(digest, {'round': int(round_number), 'author': author})
+
+        tmp = findall(r'\[(.*Z) .* Committed B(\d+)\(([^)]+)\) -> ([^ ]+=)', log)
+        commits = self._merge_results(
+            [[(d, self._to_posix(t)) for t, _, _, d in tmp]]
+        )
+        for _, round_number, author, digest in tmp:
+            headers.setdefault(digest, {'round': int(round_number), 'author': author})
 
         configs = {
             'header_size': int(
@@ -131,8 +168,25 @@ class LogParser:
         }
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
-        
-        return proposals, commits, configs, ip
+        name = search(r'Primary ([^ ]+) successfully booted on', log).group(1)
+
+        return proposals, commits, configs, ip, headers, name
+
+    def _leader_for_round(self, round_number):
+        if not self.committee_keys:
+            return None
+        return self.committee_keys[round_number % len(self.committee_keys)]
+
+    def _mark_leaders(self):
+        if not self.committee_keys:
+            return
+        for info in self.headers.values():
+            round_number = info['round']
+            author = self._resolve_author(info['author'])
+            leader = self._leader_for_round(round_number)
+            info['is_leader'] = (
+                round_number % 2 == 0 and leader is not None and leader == author
+            )
 
     def _parse_workers(self, log):
         if search(r'(?:panic|Error)', log) is not None:
@@ -166,6 +220,24 @@ class LogParser:
         latency = [c - self.proposals[d] for d, c in self.commits.items()]
         return mean(latency) if latency else 0
 
+    def _consensus_latency_breakdown(self):
+        leader_latencies = []
+        non_leader_latencies = []
+        for digest, commit_time in self.commits.items():
+            proposal_time = self.proposals.get(digest)
+            if proposal_time is None:
+                continue
+            latency = commit_time - proposal_time
+            info = self.headers.get(digest)
+            if info and info.get('is_leader'):
+                leader_latencies.append(latency)
+            else:
+                non_leader_latencies.append(latency)
+        return (
+            mean(leader_latencies) if leader_latencies else 0,
+            mean(non_leader_latencies) if non_leader_latencies else 0,
+        )
+
     def _end_to_end_throughput(self):
         if not self.commits:
             return 0, 0, 0
@@ -197,6 +269,9 @@ class LogParser:
         max_batch_delay = self.configs[0]['max_batch_delay']
 
         consensus_latency = self._consensus_latency() * 1_000
+        leader_latency, non_leader_latency = self._consensus_latency_breakdown()
+        leader_latency *= 1_000
+        non_leader_latency *= 1_000
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1_000
@@ -227,6 +302,8 @@ class LogParser:
             f' Consensus TPS: {round(consensus_tps):,} tx/s\n'
             f' Consensus BPS: {round(consensus_bps):,} B/s\n'
             f' Consensus latency: {round(consensus_latency):,} ms\n'
+            f' Leader block latency: {round(leader_latency):,} ms\n'
+            f' Non-leader block latency: {round(non_leader_latency):,} ms\n'
             '\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
@@ -243,6 +320,20 @@ class LogParser:
     def process(cls, directory, faults=0):
         assert isinstance(directory, str)
 
+        committee_keys = None
+        committee_lookup = None
+        committee_path = join(directory, '.committee.json')
+        if exists(committee_path):
+            with open(committee_path, 'r') as f:
+                committee = load(f)
+            authorities = committee.get('authorities', {})
+            if isinstance(authorities, dict) and authorities:
+                committee_keys = sorted(
+                    authorities.keys(),
+                    key=lambda name: cls._committee_key_order(name),
+                )
+                committee_lookup = cls._build_committee_lookup(committee_keys)
+
         clients = []
         for filename in sorted(glob(join(directory, 'client-*.log'))):
             with open(filename, 'r') as f:
@@ -256,4 +347,29 @@ class LogParser:
             with open(filename, 'r') as f:
                 workers += [f.read()]
 
-        return cls(clients, primaries, workers, faults=faults)
+        return cls(
+            clients,
+            primaries,
+            workers,
+            faults=faults,
+            committee_keys=committee_keys,
+            committee_lookup=committee_lookup,
+        )
+
+    @staticmethod
+    def _committee_key_order(name):
+        try:
+            return base64.b64decode(name)
+        except Exception:
+            return name.encode()
+
+    @staticmethod
+    def _build_committee_lookup(committee_keys):
+        lookup = {}
+        for key in committee_keys:
+            short = key[:16]
+            if short in lookup:
+                lookup[short] = None
+            else:
+                lookup[short] = key
+        return lookup
