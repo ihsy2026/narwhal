@@ -1,8 +1,10 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
+import base64
 from datetime import datetime
 from glob import glob
+from json import load
 from multiprocessing import Pool
-from os.path import join
+from os.path import exists, join
 from re import findall, search
 from statistics import mean
 
@@ -14,7 +16,15 @@ class ParseError(Exception):
 
 
 class LogParser:
-    def __init__(self, clients, primaries, workers, faults=0):
+    def __init__(
+        self,
+        clients,
+        primaries,
+        workers,
+        faults=0,
+        committee_keys=None,
+        committee_lookup=None,
+    ):
         inputs = [clients, primaries, workers]
         assert all(isinstance(x, list) for x in inputs)
         assert all(isinstance(x, str) for y in inputs for x in y)
@@ -48,7 +58,12 @@ class LogParser:
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
         self.headers = self._merge_headers(headers)
-        self.committee_keys = sorted(set(primary_names))
+        self.committee_keys = (
+            committee_keys
+            if committee_keys
+            else sorted(set(primary_names))
+        )
+        self.committee_lookup = committee_lookup or {}
         self._mark_leaders()
 
         # Parse the workers logs.
@@ -86,6 +101,10 @@ class LogParser:
             for digest, info in headers.items():
                 merged.setdefault(digest, info)
         return merged
+
+    def _resolve_author(self, author):
+        resolved = self.committee_lookup.get(author)
+        return resolved if resolved else author
 
     def _parse_clients(self, log):
         if search(r'Error', log) is not None:
@@ -163,7 +182,7 @@ class LogParser:
             return
         for info in self.headers.values():
             round_number = info['round']
-            author = info['author']
+            author = self._resolve_author(info['author'])
             leader = self._leader_for_round(round_number)
             info['is_leader'] = (
                 round_number % 2 == 0 and leader is not None and leader == author
@@ -249,6 +268,7 @@ class LogParser:
         batch_size = self.configs[0]['batch_size']
         max_batch_delay = self.configs[0]['max_batch_delay']
 
+        consensus_latency = self._consensus_latency() * 1_000
         leader_latency, non_leader_latency = self._consensus_latency_breakdown()
         leader_latency *= 1_000
         non_leader_latency *= 1_000
@@ -281,6 +301,7 @@ class LogParser:
             ' + RESULTS:\n'
             f' Consensus TPS: {round(consensus_tps):,} tx/s\n'
             f' Consensus BPS: {round(consensus_bps):,} B/s\n'
+            f' Consensus latency: {round(consensus_latency):,} ms\n'
             f' Leader block latency: {round(leader_latency):,} ms\n'
             f' Non-leader block latency: {round(non_leader_latency):,} ms\n'
             '\n'
@@ -299,6 +320,20 @@ class LogParser:
     def process(cls, directory, faults=0):
         assert isinstance(directory, str)
 
+        committee_keys = None
+        committee_lookup = None
+        committee_path = join(directory, '.committee.json')
+        if exists(committee_path):
+            with open(committee_path, 'r') as f:
+                committee = load(f)
+            authorities = committee.get('authorities', {})
+            if isinstance(authorities, dict) and authorities:
+                committee_keys = sorted(
+                    authorities.keys(),
+                    key=lambda name: cls._committee_key_order(name),
+                )
+                committee_lookup = cls._build_committee_lookup(committee_keys)
+
         clients = []
         for filename in sorted(glob(join(directory, 'client-*.log'))):
             with open(filename, 'r') as f:
@@ -312,4 +347,29 @@ class LogParser:
             with open(filename, 'r') as f:
                 workers += [f.read()]
 
-        return cls(clients, primaries, workers, faults=faults)
+        return cls(
+            clients,
+            primaries,
+            workers,
+            faults=faults,
+            committee_keys=committee_keys,
+            committee_lookup=committee_lookup,
+        )
+
+    @staticmethod
+    def _committee_key_order(name):
+        try:
+            return base64.b64decode(name)
+        except Exception:
+            return name.encode()
+
+    @staticmethod
+    def _build_committee_lookup(committee_keys):
+        lookup = {}
+        for key in committee_keys:
+            short = key[:16]
+            if short in lookup:
+                lookup[short] = None
+            else:
+                lookup[short] = key
+        return lookup
