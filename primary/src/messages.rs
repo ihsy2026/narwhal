@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::TryInto;
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct Header {
@@ -16,6 +17,7 @@ pub struct Header {
     pub round: Round,
     pub payload: BTreeMap<Digest, WorkerId>,
     pub parents: BTreeSet<Digest>,
+    pub created_at: u128,
     pub id: Digest,
     pub signature: Signature,
 }
@@ -28,11 +30,16 @@ impl Header {
         parents: BTreeSet<Digest>,
         signature_service: &mut SignatureService,
     ) -> Self {
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Failed to measure time")
+            .as_millis();
         let header = Self {
             author,
             round,
             payload,
             parents,
+            created_at,
             id: Digest::default(),
             signature: Signature::default(),
         };
@@ -72,6 +79,7 @@ impl Hash for Header {
         let mut hasher = Sha512::new();
         hasher.update(&self.author);
         hasher.update(self.round.to_le_bytes());
+        hasher.update(self.created_at.to_le_bytes());
         for (x, y) in &self.payload {
             hasher.update(x);
             hasher.update(y.to_le_bytes());
