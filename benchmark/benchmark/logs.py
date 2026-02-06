@@ -44,9 +44,10 @@ class LogParser:
                 results = p.map(self._parse_primaries, primaries)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse nodes\' logs: {e}')
-        proposals, commits, self.configs, primary_ips = zip(*results)
+        proposals, commits, self.configs, primary_ips, delay_summaries = zip(*results)
         self.proposals = self._merge_results([x.items() for x in proposals])
         self.commits = self._merge_results([x.items() for x in commits])
+        self.delay_summaries = delay_summaries
 
         # Parse the workers logs.
         try:
@@ -130,9 +131,28 @@ class LogParser:
             ),
         }
 
+        delay_summary = None
+        summary_matches = findall(
+            r'Commit delay summary: leader_avg_ms=([^,]+), leader_count=(\d+), '
+            r'non_leader_avg_ms=([^,]+), non_leader_count=(\d+)',
+            log,
+        )
+        if summary_matches:
+            leader_avg_ms, leader_count, non_leader_avg_ms, non_leader_count = summary_matches[-1]
+            delay_summary = {
+                'leader_avg_ms': (
+                    float(leader_avg_ms) if leader_avg_ms != 'n/a' else None
+                ),
+                'leader_count': int(leader_count),
+                'non_leader_avg_ms': (
+                    float(non_leader_avg_ms) if non_leader_avg_ms != 'n/a' else None
+                ),
+                'non_leader_count': int(non_leader_count),
+            }
+
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
         
-        return proposals, commits, configs, ip
+        return proposals, commits, configs, ip, delay_summary
 
     def _parse_workers(self, log):
         if search(r'(?:panic|Error)', log) is not None:
@@ -200,6 +220,24 @@ class LogParser:
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
         end_to_end_latency = self._end_to_end_latency() * 1_000
+        leader_avgs = [
+            x['leader_avg_ms']
+            for x in self.delay_summaries
+            if x and x['leader_avg_ms'] is not None
+        ]
+        non_leader_avgs = [
+            x['non_leader_avg_ms']
+            for x in self.delay_summaries
+            if x and x['non_leader_avg_ms'] is not None
+        ]
+        leader_count = sum(
+            x['leader_count'] for x in self.delay_summaries if x
+        )
+        non_leader_count = sum(
+            x['non_leader_count'] for x in self.delay_summaries if x
+        )
+        leader_avg_ms = mean(leader_avgs) if leader_avgs else 0
+        non_leader_avg_ms = mean(non_leader_avgs) if non_leader_avgs else 0
 
         return (
             '\n'
@@ -227,6 +265,10 @@ class LogParser:
             f' Consensus TPS: {round(consensus_tps):,} tx/s\n'
             f' Consensus BPS: {round(consensus_bps):,} B/s\n'
             f' Consensus latency: {round(consensus_latency):,} ms\n'
+            f' Leader commit latency avg: {round(leader_avg_ms):,} ms'
+            f' (count {leader_count:,})\n'
+            f' Non-leader commit latency avg: {round(non_leader_avg_ms):,} ms'
+            f' (count {non_leader_count:,})\n'
             '\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'

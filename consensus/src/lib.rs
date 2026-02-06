@@ -6,6 +6,7 @@ use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, Round};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[cfg(test)]
@@ -87,6 +88,53 @@ pub struct Consensus {
     genesis: Vec<Certificate>,
 }
 
+#[derive(Default)]
+struct DelayStats {
+    leader_total_ms: u128,
+    leader_count: u64,
+    non_leader_total_ms: u128,
+    non_leader_count: u64,
+}
+
+impl DelayStats {
+    fn record(&mut self, is_leader: bool, delay_ms: u128) {
+        if is_leader {
+            self.leader_total_ms += delay_ms;
+            self.leader_count += 1;
+        } else {
+            self.non_leader_total_ms += delay_ms;
+            self.non_leader_count += 1;
+        }
+    }
+
+    fn leader_avg_ms(&self) -> Option<u128> {
+        if self.leader_count == 0 {
+            None
+        } else {
+            Some(self.leader_total_ms / self.leader_count as u128)
+        }
+    }
+
+    fn non_leader_avg_ms(&self) -> Option<u128> {
+        if self.non_leader_count == 0 {
+            None
+        } else {
+            Some(self.non_leader_total_ms / self.non_leader_count as u128)
+        }
+    }
+}
+
+fn header_delay_ms(certificate: &Certificate) -> Option<u128> {
+    if certificate.header.created_at == 0 {
+        return None;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Failed to measure time")
+        .as_millis();
+    Some(now.saturating_sub(certificate.header.created_at))
+}
+
 impl Consensus {
     // 后台异步任务，捕获变量并调用共识主循环
     pub fn spawn(
@@ -115,6 +163,7 @@ impl Consensus {
         // The consensus state (everything else is immutable).
         // 初始化State状态
         let mut state = State::new(self.genesis.clone());
+        let mut delay_stats = DelayStats::default();
 
         // Listen to incoming certificates.
         // 监听来自Primary的证书
@@ -175,8 +224,11 @@ impl Consensus {
             // leader 达标，准备生成提交序列 sequence
             debug!("Leader {:?} has enough support", leader);
             let mut sequence = Vec::new();
+            let leaders = self.order_leaders(leader, &state);
+            let leader_digests: HashSet<Digest> =
+                leaders.iter().map(|certificate| certificate.digest()).collect();
             // 找出与当前leader往前连接的最前面的leader并反转，保证提交顺序正确
-            for leader in self.order_leaders(leader, &state).iter().rev() {
+            for leader in leaders.iter().rev() {
                 // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
                 for x in self.order_dag(leader, &state) {
                     // Update and clean up internal state.
@@ -199,8 +251,34 @@ impl Consensus {
             // Output the sequence in the right order.
             // 输出提交序列到 primary 和应用层
             for certificate in sequence {
+                let is_leader = leader_digests.contains(&certificate.digest());
+                let marker = if is_leader { "LEADER" } else { "NON-LEADER" };
+                let delay_ms = header_delay_ms(&certificate);
+                if let Some(delay_ms) = delay_ms {
+                    delay_stats.record(is_leader, delay_ms);
+                    let leader_avg_ms = delay_stats.leader_avg_ms();
+                    let non_leader_avg_ms = delay_stats.non_leader_avg_ms();
+                    info!(
+                        "[{}] Committed {} (delay_ms={}, leader_avg_ms={}, non_leader_avg_ms={})",
+                        marker,
+                        certificate.header,
+                        delay_ms,
+                        leader_avg_ms
+                            .map(|avg| avg.to_string())
+                            .unwrap_or_else(|| "n/a".to_string()),
+                        non_leader_avg_ms
+                            .map(|avg| avg.to_string())
+                            .unwrap_or_else(|| "n/a".to_string())
+                    );
+                } else {
+                    info!(
+                        "[{}] Committed {} (delay_ms=n/a)",
+                        marker, certificate.header
+                    );
+                }
+
                 #[cfg(not(feature = "benchmark"))]
-                info!("Committed {}", certificate.header);
+                debug!("Committed {}", certificate.header);
 
                 #[cfg(feature = "benchmark")]
                 for digest in certificate.header.payload.keys() {
@@ -216,6 +294,22 @@ impl Consensus {
                 if let Err(e) = self.tx_output.send(certificate).await {
                     warn!("Failed to output certificate: {}", e);
                 }
+            }
+
+            if delay_stats.leader_count > 0 || delay_stats.non_leader_count > 0 {
+                info!(
+                    "Commit delay summary: leader_avg_ms={}, leader_count={}, non_leader_avg_ms={}, non_leader_count={}",
+                    delay_stats
+                        .leader_avg_ms()
+                        .map(|avg| avg.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    delay_stats.leader_count,
+                    delay_stats
+                        .non_leader_avg_ms()
+                        .map(|avg| avg.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    delay_stats.non_leader_count
+                );
             }
         }
     }
