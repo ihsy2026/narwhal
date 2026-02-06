@@ -295,6 +295,22 @@ impl Consensus {
                     warn!("Failed to output certificate: {}", e);
                 }
             }
+
+            if delay_stats.leader_count > 0 || delay_stats.non_leader_count > 0 {
+                info!(
+                    "Commit delay summary: leader_avg_ms={}, leader_count={}, non_leader_avg_ms={}, non_leader_count={}",
+                    delay_stats
+                        .leader_avg_ms()
+                        .map(|avg| avg.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    delay_stats.leader_count,
+                    delay_stats
+                        .non_leader_avg_ms()
+                        .map(|avg| avg.to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    delay_stats.non_leader_count
+                );
+            }
         }
     }
 
