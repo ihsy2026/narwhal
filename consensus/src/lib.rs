@@ -4,13 +4,16 @@ use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, Round};
+use contribution::ContributionWindow;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc::{Receiver, Sender};
+use std::cmp::Ordering;
 
 #[cfg(test)]
 #[path = "tests/consensus_tests.rs"]
 pub mod consensus_tests;
+mod contribution;
 
 /// The representation of the DAG in memory.
 type Dag = HashMap<Round, HashMap<PublicKey, (Digest, Certificate)>>;
@@ -85,6 +88,10 @@ pub struct Consensus {
 
     /// The genesis certificates.
     genesis: Vec<Certificate>,
+    /// Whether to enable contribution-aware support in leader commitment checks.
+    contribution_consensus: bool,
+    /// Sliding window of recent contributors.
+    contribution_window: ContributionWindow,
 }
 
 impl Consensus {
@@ -104,6 +111,10 @@ impl Consensus {
                 tx_primary,
                 tx_output,
                 genesis: Certificate::genesis(&committee),
+                contribution_consensus: std::env::var("NARWHAL_CONTRIBUTION_CONSENSUS")
+                    .map(|value| value == "1")
+                    .unwrap_or(false),
+                contribution_window: ContributionWindow::new(),
             }
                 .run()
                 .await;
@@ -122,7 +133,7 @@ impl Consensus {
             debug!("Processing {:?}", certificate);
             // 取出证书所在的轮次
             let round = certificate.round();
-
+            self.contribution_window.record_block(certificate.origin());
             // Add the new certificate to the local storage.
             // 将新监听到的证书加入DAG，持续构建本地DAG视图
             state
@@ -160,7 +171,17 @@ impl Consensus {
                 .expect("We should have the whole history by now") // 没有找到历史就直接panic
                 .values() // 遍历这一轮所有的(Digest, Certificate)
                 .filter(|(_, x)| x.header.parents.contains(&leader_digest)) // 筛选出证书的parents包含leader的
-                .map(|(_, x)| self.committee.stake(&x.origin())) // 把支持者的stake取出来
+                .map(|(_, x)| {
+                    let base_stake = self.committee.stake(&x.origin());
+                    if self.contribution_consensus
+                        && ContributionWindow::should_use_contribution_weight(r)
+                    {
+                        self.contribution_window
+                            .weighted_stake(&x.origin(), base_stake)
+                    } else {
+                        base_stake
+                    }
+                })
                 .sum(); // 加和
 
             // If it is the case, we can commit the leader. But first, we need to recursively go back to
@@ -195,7 +216,7 @@ impl Consensus {
                     debug!("Latest commit of {}: Round {}", name, round);
                 }
             }
-
+            let sequence = self.select_commit_sequence(sequence, r);
             // Output the sequence in the right order.
             // 输出提交序列到 primary 和应用层
             for certificate in sequence {
@@ -330,5 +351,45 @@ impl Consensus {
         // Ordering the output by round is not really necessary but it makes the commit sequence prettier.
         ordered.sort_by_key(|x| x.round());
         ordered
+    }
+
+    // 输入证书序列和当前轮次，返回处理后的证书序列
+    fn select_commit_sequence(
+        &self,
+        mut sequence: Vec<Certificate>,
+        round: Round,
+    ) -> Vec<Certificate> {
+        // 早返回条件
+        if !(self.contribution_consensus
+            && ContributionWindow::should_use_contribution_weight(round))
+        {
+            return sequence;
+        }
+        // 取出所有公钥收集为ranked
+        let mut ranked: Vec<_> = self.committee.authorities.keys().cloned().collect();
+        // 按贡献度排序，若贡献度相同则用公钥字典序
+        ranked.sort_by(|left, right| {
+            self.contribution_window
+                .contribution(right)
+                .partial_cmp(&self.contribution_window.contribution(left))
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.cmp(right))
+        });
+
+        let n = self.committee.size();
+        let f = n.saturating_sub(1) / 3;
+        let top_k = (2 * f + 1).min(n);
+
+        let selected: HashSet<_> = ranked.into_iter().take(top_k).collect();
+
+        sequence.retain(|certificate| selected.contains(&certificate.origin()));
+        sequence.sort_by(|left, right| {
+            self.contribution_window
+                .contribution(&right.origin())
+                .partial_cmp(&self.contribution_window.contribution(&left.origin()))
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.round().cmp(&right.round()))
+        });
+        sequence
     }
 }

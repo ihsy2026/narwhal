@@ -2,9 +2,12 @@
 use crate::error::DagResult;
 use crate::header_waiter::WaiterMessage;
 use crate::messages::{Certificate, Header};
+use crate::primary::PrimaryMessage;
+use bytes::Bytes;
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
+use network::SimpleSender;
 use std::collections::HashMap;
 use store::Store;
 use tokio::sync::mpsc::Sender;
@@ -14,12 +17,16 @@ use tokio::sync::mpsc::Sender;
 pub struct Synchronizer {
     /// The public key of this primary.
     name: PublicKey,
+    /// The committee information.
+    committee: Committee,
     /// The persistent storage.
     store: Store,
     /// Send commands to the `HeaderWaiter`.
     tx_header_waiter: Sender<WaiterMessage>,
     /// Send commands to the `CertificateWaiter`.
     tx_certificate_waiter: Sender<Certificate>,
+    /// Network sender allowing us to request missing certificates.
+    network: SimpleSender,
     /// The genesis and its digests.
     genesis: Vec<(Digest, Certificate)>,
 }
@@ -34,9 +41,11 @@ impl Synchronizer {
     ) -> Self {
         Self {
             name,
+            committee: committee.clone(),
             store,
             tx_header_waiter,
             tx_certificate_waiter,
+            network: SimpleSender::new(),
             genesis: Certificate::genesis(committee)
                 .into_iter()
                 .map(|x| (x.digest(), x))
@@ -120,19 +129,40 @@ impl Synchronizer {
     /// Check whether we have all the ancestors of the certificate. If we don't, send the certificate to
     /// the `CertificateWaiter` which will trigger re-processing once we have all the missing data.
     pub async fn deliver_certificate(&mut self, certificate: &Certificate) -> DagResult<bool> {
+        let mut missing = Vec::new();
+        // 遍历父引用
         for digest in &certificate.header.parents {
             if self.genesis.iter().any(|(x, _)| x == digest) {
                 continue;
             }
-
+            // 查本地是否存在
             if self.store.read(digest.to_vec()).await?.is_none() {
-                self.tx_certificate_waiter
-                    .send(certificate.clone())
-                    .await
-                    .expect("Failed to send sync certificate request");
-                return Ok(false);
-            };
+                missing.push(digest.clone());
+            }
         }
-        Ok(true)
+
+        if missing.is_empty() {
+            return Ok(true);
+        }
+        // 如果有缺失，先把当前证书放入CertificateWaiter
+        self.tx_certificate_waiter
+            .send(certificate.clone())
+            .await
+            .expect("Failed to send sync certificate request");
+
+        // Ask the certificate's author to send the missing parents.
+        // 计算应向谁请求缺失祖先
+        let address = self
+            .committee
+            .primary(&certificate.header.author)
+            .expect("Author of valid certificate not in the committee")
+            .primary_to_primary;
+        // 组装同步请求消息
+        let message = PrimaryMessage::CertificatesRequest(missing, self.name);
+        // 序列化并网络发送
+        let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
+        self.network.send(address, Bytes::from(bytes)).await;
+
+        Ok(false)
     }
 }
